@@ -1,5 +1,4 @@
 const express = require('express');
-const { Pool } = require('pg');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -17,59 +16,14 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '254700000';
 const HEROKU_API = 'https://api.heroku.com';
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-async function migrateDb() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        github_username TEXT PRIMARY KEY,
-        is_approved BOOLEAN DEFAULT true,
-        is_banned BOOLEAN DEFAULT false,
-        max_bots INTEGER DEFAULT 2,
-        deployment_count INTEGER DEFAULT 0,
-        subscription_plan TEXT DEFAULT 'free',
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bots (
-        app_name TEXT PRIMARY KEY,
-        heroku_app_name TEXT,
-        github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
-        created_at TIMESTAMP DEFAULT NOW(),
-        status TEXT DEFAULT 'running'
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS plans (
-        id SERIAL PRIMARY KEY,
-        name TEXT UNIQUE,
-        price TEXT,
-        duration_days INTEGER,
-        max_bots INTEGER,
-        features TEXT[],
-        is_active BOOLEAN DEFAULT true
-      );
-    `);
-    const { rows } = await client.query('SELECT COUNT(*) FROM plans');
-    if (parseInt(rows[0].count) === 0) {
-      await client.query(`
-        INSERT INTO plans (name, price, duration_days, max_bots, features) VALUES
-        ('Free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features'], true)
-      `);
-    }
-  } catch (err) {
-    console.error('Migration error:', err);
-  } finally {
-    client.release();
-  }
-}
-migrateDb().catch(console.error);
+// In-memory storage - resets on restart
+let users = {};
+let bots = [];
+let plans = [
+  { id: 1, name: 'Free', price: 'Free', duration_days: 36500, max_bots: 2, features: ['2 bots', 'Basic features'], is_active: true },
+  { id: 2, name: 'Pro', price: '$5/month', duration_days: 30, max_bots: 5, features: ['5 bots', 'Priority deploy', '24/7 support'], is_active: true },
+  { id: 3, name: 'Ultra', price: '$15/month', duration_days: 30, max_bots: 15, features: ['15 bots', 'Dedicated resources', 'Custom domain'], is_active: true }
+];
 
 async function checkFork(username) {
   try {
@@ -136,8 +90,7 @@ async function deleteHerokuApp(appName) {
 
 // API Routes
 app.get('/api/plans', async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM plans WHERE is_active = true ORDER BY id');
-  res.json({ plans: rows, whatsapp: WHATSAPP_NUMBER });
+  res.json({ plans: plans.filter(p => p.is_active), whatsapp: WHATSAPP_NUMBER });
 });
 
 app.post('/check-fork', async (req, res) => {
@@ -145,30 +98,32 @@ app.post('/check-fork', async (req, res) => {
   if (!githubUsername) return res.status(400).json({ error: 'Username required' });
 
   const forkInfo = await checkFork(githubUsername);
-  const user = await pool.query('SELECT * FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
-  let userData = user.rows[0];
+  const username = githubUsername.toLowerCase();
 
-  if (!userData) {
-    await pool.query(
-      'INSERT INTO users (github_username, max_bots, subscription_plan) VALUES ($1, $2, $3)',
-      [githubUsername.toLowerCase(), 2, 'free']
-    );
-    userData = { github_username: githubUsername.toLowerCase(), is_approved: true, is_banned: false, max_bots: 2, deployment_count: 0, subscription_plan: 'free' };
+  if (!users[username]) {
+    users[username] = {
+      github_username: username,
+      is_approved: true,
+      is_banned: false,
+      max_bots: 2,
+      deployment_count: 0,
+      subscription_plan: 'free'
+    };
   }
 
-  const bots = await pool.query('SELECT app_name, heroku_app_name, created_at, status FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  const userBots = bots.filter(b => b.github_username === username);
 
   res.json({
     hasFork: forkInfo.hasFork,
     forkUrl: forkInfo.forkUrl,
     forkError: forkInfo.error,
-    isApproved: userData.is_approved,
-    isBanned: userData.is_banned,
-    maxBots: userData.max_bots,
-    deploymentCount: userData.deployment_count,
-    subscriptionPlan: userData.subscription_plan,
-    deployedBots: bots.rows,
-    currentBots: bots.rows.length
+    isApproved: users[username].is_approved,
+    isBanned: users[username].is_banned,
+    maxBots: users[username].max_bots,
+    deploymentCount: users[username].deployment_count,
+    subscriptionPlan: users[username].subscription_plan,
+    deployedBots: userBots,
+    currentBots: userBots.length
   });
 });
 
@@ -176,34 +131,38 @@ app.post('/deploy', async (req, res) => {
   const { githubUsername, sessionId } = req.body;
   if (!githubUsername ||!sessionId) return res.status(400).json({ error: 'Missing fields' });
 
-  const user = await pool.query('SELECT * FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
-  if (user.rows.length === 0) return res.status(403).json({ error: 'User not found' });
-  const userData = user.rows[0];
+  const username = githubUsername.toLowerCase();
+  if (!users[username]) return res.status(403).json({ error: 'User not found' });
 
+  const userData = users[username];
   if (userData.is_banned) return res.status(403).json({ error: 'User is banned' });
   if (!userData.is_approved) return res.status(403).json({ error: 'User not approved' });
 
-  const botCount = await pool.query('SELECT COUNT(*) FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
-  if (parseInt(botCount.rows[0].count) >= userData.max_bots) {
+  const userBots = bots.filter(b => b.github_username === username);
+  if (userBots.length >= userData.max_bots) {
     return res.status(403).json({ error: `Bot limit reached (max ${userData.max_bots} bots)` });
   }
 
-  const baseName = `teddy-${githubUsername}`;
+  const baseName = `teddy-${username}`;
 
   try {
     const app = await createHerokuApp(baseName);
     await setHerokuConfigVars(app.name, { SESSION_ID: sessionId });
 
-    const forkInfo = await checkFork(githubUsername);
+    const forkInfo = await checkFork(username);
     if (!forkInfo.hasFork) throw new Error('User does not have a fork');
 
     await deployFromGitHub(app.name, forkInfo.forkUrl);
 
-    await pool.query(
-      'INSERT INTO bots (app_name, heroku_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
-      [baseName, app.name, githubUsername.toLowerCase(), 'deploying']
-    );
-    await pool.query('UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1', [githubUsername.toLowerCase()]);
+    bots.push({
+      app_name: baseName,
+      heroku_app_name: app.name,
+      github_username: username,
+      created_at: new Date().toISOString(),
+      status: 'deploying'
+    });
+
+    users[username].deployment_count += 1;
 
     res.json({
       success: true,
@@ -219,12 +178,12 @@ app.post('/deploy', async (req, res) => {
 
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
-  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
-  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
+  const botIndex = bots.findIndex(b => b.app_name === appName);
+  if (botIndex === -1) return res.status(404).json({ error: 'Bot not found' });
 
   try {
-    await deleteHerokuApp(bot.rows[0].heroku_app_name);
-    await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+    await deleteHerokuApp(bots[botIndex].heroku_app_name);
+    bots.splice(botIndex, 1);
     res.json({ success: true, message: 'Bot deleted from Heroku' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -239,36 +198,17 @@ app.post('/admin/login', (req, res) => {
 
 app.post('/admin/users', async (req, res) => {
   if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query(`
-    SELECT u.*, COUNT(b.app_name) as active_bots
-    FROM users u
-    LEFT JOIN bots b ON u.github_username = b.github_username
-    GROUP BY u.github_username
-  `);
-  res.json({ users: rows });
-});
 
-app.post('/admin/seed-plans', async (req, res) => {
-  if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    await pool.query(`
-      INSERT INTO plans (name, price, duration_days, max_bots, features, is_active)
-      VALUES
-      ('Free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features'], true),
-      ('Pro', '$5/month', 30, 5, ARRAY['5 bots', 'Priority deploy', '24/7 support'], true),
-      ('Ultra', '$15/month', 30, 15, ARRAY['15 bots', 'Dedicated resources', 'Custom domain'], true)
-      ON CONFLICT (name) DO NOTHING
-    `);
-    res.json({ success: true, message: 'Plans seeded' });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  const userList = Object.values(users).map(u => ({
+   ...u,
+    active_bots: bots.filter(b => b.github_username === u.github_username).length
+  }));
+  res.json({ users: userList });
 });
 
 app.post('/get-all-apps', async (req, res) => {
   if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query('SELECT * FROM bots ORDER BY created_at DESC');
-  res.json({ apps: rows });
+  res.json({ apps: bots });
 });
 
 // Serve static frontend
