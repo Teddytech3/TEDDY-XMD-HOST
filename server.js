@@ -220,7 +220,7 @@ app.post('/admin/login', (req, res) => {
 app.post('/admin/users', (req, res) => {
   if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const userList = Object.values(users).map(u => ({
-  ...u,
+ ...u,
     active_bots: bots.filter(b => b.github_username === u.github_username).length
   }));
   res.json({ users: userList });
@@ -232,24 +232,31 @@ app.post('/admin/heroku-apps', async (req, res) => {
   try {
     let apps;
     if (HEROKU_TEAM) {
+      console.log('Fetching apps for team:', HEROKU_TEAM);
       apps = await herokuRequest('GET', `/teams/${HEROKU_TEAM}/apps`);
     } else {
+      console.log('Fetching personal apps');
       apps = await herokuRequest('GET', '/apps');
     }
 
-    const botApps = apps.filter(app => app.name.startsWith('teddy-')).map(app => ({
-      name: app.name,
-      id: app.id,
-      created_at: app.created_at,
-      updated_at: app.updated_at,
-      web_url: app.web_url,
-      region: app.region?.name || 'us',
-      team: app.team?.name || 'personal'
-    }));
+    console.log(`Found ${apps.length} total apps`);
 
+    const botApps = apps
+     .filter(app => app.name.startsWith('teddy-'))
+     .map(app => ({
+        name: app.name,
+        id: app.id,
+        created_at: app.created_at,
+        updated_at: app.updated_at,
+        web_url: app.web_url,
+        region: app.region?.name || 'us',
+        team: app.team?.name || 'personal'
+      }));
+
+    console.log(`Filtered to ${botApps.length} bot apps`);
     res.json({ apps: botApps });
   } catch (error) {
-    console.error('Heroku apps error:', error);
+    console.error('Heroku apps error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
