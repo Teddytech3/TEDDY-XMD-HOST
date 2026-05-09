@@ -148,8 +148,21 @@
       <button class="btn btn-pri" style="width:100%" onclick="doAdminLogin()">Login</button>
     </div>
   </div>
+
   <div id="adminDash" style="display:none;padding:28px 24px">
-    <div id="at-users"></div>
+    <div class="tabs">
+      <div class="tab active" id="t-users" onclick="switchAdminTab('users')">👥 Users</div>
+      <div class="tab" id="t-heroku" onclick="switchAdminTab('heroku')">☁️ Heroku Apps</div>
+    </div>
+
+    <div id="tab-users">
+      <div id="at-users"></div>
+    </div>
+
+    <div id="tab-heroku" style="display:none">
+      <div id="at-heroku"></div>
+      <button class="btn btn-out sm" onclick="loadHerokuApps()">🔄 Refresh</button>
+    </div>
   </div>
 </div>
 
@@ -317,7 +330,9 @@ async function loadPlans() {
           }
         </div>`;
     }).join('');
-  } catch { g.innerHTML = '<div style="color:var(--tx3)">Failed to load plans</div>'; }
+  } catch {
+    g.innerHTML = '<div style="color:var(--tx3)">Failed to load plans</div>';
+  }
 }
 
 async function doAdminLogin() {
@@ -327,11 +342,59 @@ async function doAdminLogin() {
     AP = pwd;
     document.getElementById('adminLogin').style.display = 'none';
     document.getElementById('adminDash').style.display = 'block';
-    const users = await post('/admin/users', { password: AP });
-    document.getElementById('at-users').innerHTML = `<pre style="color:var(--tx2)">${JSON.stringify(users.users, null, 2)}</pre>`;
+    loadAdminUsers();
   } else {
     alert2('aLoginAlert', '❌ Invalid password', 'ae');
   }
+}
+
+function switchAdminTab(name) {
+  ['users','heroku'].forEach(t => {
+    document.getElementById('t-'+t).classList.toggle('active', t===name);
+    document.getElementById('tab-'+t).style.display = t===name? 'block':'none';
+  });
+  if (name === 'heroku') loadHerokuApps();
+}
+
+async function loadAdminUsers() {
+  const data = await post('/admin/users', { password: AP });
+  document.getElementById('at-users').innerHTML = `<pre style="color:var(--tx2);overflow:auto">${JSON.stringify(data.users, null, 2)}</pre>`;
+}
+
+async function loadHerokuApps() {
+  const container = document.getElementById('at-heroku');
+  container.innerHTML = '<div style="color:var(--tx3)">Loading...</div>';
+  const data = await post('/admin/heroku-apps', { password: AP });
+  if (data.error) {
+    container.innerHTML = `<div class="alert ae">${data.error}</div>`;
+    return;
+  }
+  if (!data.apps.length) {
+    container.innerHTML = '<div style="color:var(--tx3);text-align:center;padding:40px">No Heroku apps found</div>';
+    return;
+  }
+  container.innerHTML = data.apps.map(app => `
+    <div class="botcard">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <div>
+          <div class="appname">☁️ ${app.name}</div>
+          <div style="color:var(--tx3);font-size:.8rem">
+            Created: ${new Date(app.created_at).toLocaleDateString()} |
+            Region: ${app.region}
+          </div>
+          <a href="${app.web_url}" target="_blank" style="color:var(--pl);font-size:.85rem">${app.web_url}</a>
+        </div>
+        <button class="btn btn-red sm" onclick="deleteHerokuApp('${app.name}')">🗑️ Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function deleteHerokuApp(appName) {
+  if (!confirm(`Delete Heroku app "${appName}"? This cannot be undone.`)) return;
+  const data = await post('/admin/delete-heroku-app', { password: AP, appName: appName });
+  notif(data.message || data.error, data.success? 'success' : 'error');
+  if (data.success) loadHerokuApps();
 }
 </script>
 </body>
