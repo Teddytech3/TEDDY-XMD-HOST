@@ -13,6 +13,8 @@ app.use(express.json());
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'teddy';
 const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
 const HEROKU_TEAM = process.env.HEROKU_TEAM;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '254700000';
 const HEROKU_API = 'https://api.heroku.com';
 
 const pool = new Pool({
@@ -56,10 +58,10 @@ async function migrateDb() {
     `);
     const { rows } = await client.query('SELECT COUNT(*) FROM plans');
     if (parseInt(rows[0].count) === 0) {
-      await client.query(
-        `INSERT INTO plans (name, price, duration_days, max_bots, features) VALUES
-         ('free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features'])`
-      );
+      await client.query(`
+        INSERT INTO plans (name, price, duration_days, max_bots, features) VALUES
+        ('Free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features'], true)
+      `);
     }
   } catch (err) {
     console.error('Migration error:', err);
@@ -71,13 +73,21 @@ migrateDb().catch(console.error);
 
 async function checkFork(username) {
   try {
+    const headers = {
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'teddy-xmd-deployer'
+    };
+    if (GITHUB_TOKEN) headers['Authorization'] = `token ${GITHUB_TOKEN}`;
+
     const url = `https://api.github.com/repos/Teddytech1/TEDDY-XMD/forks?per_page=100`;
-    const resp = await axios.get(url, { timeout: 10000 });
+    const resp = await axios.get(url, { headers, timeout: 15000 });
+
     const forks = resp.data;
     const userFork = forks.find(fork => fork.owner.login.toLowerCase() === username.toLowerCase());
-    return { hasFork:!!userFork, forkUrl: userFork?.html_url };
+    return { hasFork:!!userFork, forkUrl: userFork?.html_url, error: null };
   } catch (e) {
-    return { hasFork: false, error: e.message };
+    console.error('GitHub API error:', e.response?.data || e.message);
+    return { hasFork: false, error: e.response?.data?.message || e.message };
   }
 }
 
@@ -95,9 +105,7 @@ async function herokuRequest(method, path, data = null) {
     });
     return response.data;
   } catch (err) {
-    if (err.response) {
-      throw new Error(`Heroku API error: ${err.response.data.message || err.response.statusText}`);
-    }
+    if (err.response) throw new Error(`Heroku API error: ${err.response.data.message || err.response.statusText}`);
     throw err;
   }
 }
@@ -105,10 +113,8 @@ async function herokuRequest(method, path, data = null) {
 async function createHerokuApp(baseName) {
   const safeBase = baseName.toLowerCase().replace(/[^a-z0-9-]/g, '');
   const appName = `${safeBase}-${crypto.randomBytes(4).toString('hex')}`;
-
   const payload = { name: appName, region: 'us' };
   if (HEROKU_TEAM) payload.team = HEROKU_TEAM;
-
   const data = await herokuRequest('POST', '/apps', payload);
   return { id: data.id, name: data.name };
 }
@@ -130,8 +136,8 @@ async function deleteHerokuApp(appName) {
 
 // API Routes
 app.get('/api/plans', async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM plans WHERE is_active = true');
-  res.json({ plans: rows });
+  const { rows } = await pool.query('SELECT * FROM plans WHERE is_active = true ORDER BY id');
+  res.json({ plans: rows, whatsapp: WHATSAPP_NUMBER });
 });
 
 app.post('/check-fork', async (req, res) => {
@@ -147,24 +153,15 @@ app.post('/check-fork', async (req, res) => {
       'INSERT INTO users (github_username, max_bots, subscription_plan) VALUES ($1, $2, $3)',
       [githubUsername.toLowerCase(), 2, 'free']
     );
-    userData = {
-      github_username: githubUsername.toLowerCase(),
-      is_approved: true,
-      is_banned: false,
-      max_bots: 2,
-      deployment_count: 0,
-      subscription_plan: 'free'
-    };
+    userData = { github_username: githubUsername.toLowerCase(), is_approved: true, is_banned: false, max_bots: 2, deployment_count: 0, subscription_plan: 'free' };
   }
 
-  const bots = await pool.query(
-    'SELECT app_name, heroku_app_name, created_at, status FROM bots WHERE github_username = $1',
-    [githubUsername.toLowerCase()]
-  );
+  const bots = await pool.query('SELECT app_name, heroku_app_name, created_at, status FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
 
   res.json({
     hasFork: forkInfo.hasFork,
     forkUrl: forkInfo.forkUrl,
+    forkError: forkInfo.error,
     isApproved: userData.is_approved,
     isBanned: userData.is_banned,
     maxBots: userData.max_bots,
@@ -206,18 +203,14 @@ app.post('/deploy', async (req, res) => {
       'INSERT INTO bots (app_name, heroku_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
       [baseName, app.name, githubUsername.toLowerCase(), 'deploying']
     );
-    await pool.query(
-      'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
-      [githubUsername.toLowerCase()]
-    );
+    await pool.query('UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1', [githubUsername.toLowerCase()]);
 
     res.json({
       success: true,
       appName: baseName,
       herokuAppName: app.name,
-      message: `Bot deployed to Heroku successfully! Access at https://${app.name}.herokuapp.com`
+      message: `Bot deployed! Access at https://${app.name}.herokuapp.com`
     });
-
   } catch (error) {
     console.error('Deployment error:', error);
     res.status(500).json({ error: 'Failed to deploy to Heroku', details: error.message });
@@ -255,16 +248,31 @@ app.post('/admin/users', async (req, res) => {
   res.json({ users: rows });
 });
 
+app.post('/admin/seed-plans', async (req, res) => {
+  if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    await pool.query(`
+      INSERT INTO plans (name, price, duration_days, max_bots, features, is_active)
+      VALUES
+      ('Free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features'], true),
+      ('Pro', '$5/month', 30, 5, ARRAY['5 bots', 'Priority deploy', '24/7 support'], true),
+      ('Ultra', '$15/month', 30, 15, ARRAY['15 bots', 'Dedicated resources', 'Custom domain'], true)
+      ON CONFLICT (name) DO NOTHING
+    `);
+    res.json({ success: true, message: 'Plans seeded' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/get-all-apps', async (req, res) => {
   if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { rows } = await pool.query('SELECT * FROM bots ORDER BY created_at DESC');
   res.json({ apps: rows });
 });
 
-// Serve static frontend from /public
+// Serve static frontend
 app.use(express.static(path.join(__dirname, 'public')));
-
-// Fallback to index.html for SPA routing
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
