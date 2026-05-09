@@ -9,7 +9,7 @@ const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
-let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'teddy';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'teddy';
 const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
 const HEROKU_TEAM = process.env.HEROKU_TEAM;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -67,8 +67,14 @@ async function herokuRequest(method, path, data = null) {
 async function createHerokuApp(baseName) {
   const safeBase = baseName.toLowerCase().replace(/[^a-z0-9-]/g, '');
   const appName = `${safeBase}-${crypto.randomBytes(4).toString('hex')}`;
+
   const payload = { name: appName, region: 'us' };
-  if (HEROKU_TEAM) payload.team = HEROKU_TEAM;
+
+  if (HEROKU_TEAM) {
+    payload.team = HEROKU_TEAM;
+    console.log('Creating app in team:', HEROKU_TEAM);
+  }
+
   const data = await herokuRequest('POST', '/apps', payload);
   return { id: data.id, name: data.name };
 }
@@ -88,8 +94,8 @@ async function deleteHerokuApp(appName) {
   await herokuRequest('DELETE', `/apps/${appName}`);
 }
 
-// API Routes
-app.get('/api/plans', async (req, res) => {
+// Routes
+app.get('/api/plans', (req, res) => {
   res.json({ plans: plans.filter(p => p.is_active), whatsapp: WHATSAPP_NUMBER });
 });
 
@@ -132,11 +138,19 @@ app.post('/deploy', async (req, res) => {
   if (!githubUsername ||!sessionId) return res.status(400).json({ error: 'Missing fields' });
 
   const username = githubUsername.toLowerCase();
-  if (!users[username]) return res.status(403).json({ error: 'User not found' });
+  if (!users[username]) {
+    users[username] = {
+      github_username: username,
+      is_approved: true,
+      is_banned: false,
+      max_bots: 2,
+      deployment_count: 0,
+      subscription_plan: 'free'
+    };
+  }
 
   const userData = users[username];
   if (userData.is_banned) return res.status(403).json({ error: 'User is banned' });
-  if (!userData.is_approved) return res.status(403).json({ error: 'User not approved' });
 
   const userBots = bots.filter(b => b.github_username === username);
   if (userBots.length >= userData.max_bots) {
@@ -146,12 +160,18 @@ app.post('/deploy', async (req, res) => {
   const baseName = `teddy-${username}`;
 
   try {
+    console.log('Creating Heroku app for:', baseName);
     const app = await createHerokuApp(baseName);
+    console.log('App created:', app.name);
+
+    console.log('Setting config vars...');
     await setHerokuConfigVars(app.name, { SESSION_ID: sessionId });
 
+    console.log('Checking fork for:', username);
     const forkInfo = await checkFork(username);
-    if (!forkInfo.hasFork) throw new Error('User does not have a fork');
+    if (!forkInfo.hasFork) throw new Error('GitHub fork not found. Fork https://github.com/Teddytech1/TEDDY-XMD first');
 
+    console.log('Deploying from GitHub...');
     await deployFromGitHub(app.name, forkInfo.forkUrl);
 
     bots.push({
@@ -171,8 +191,8 @@ app.post('/deploy', async (req, res) => {
       message: `Bot deployed! Access at https://${app.name}.herokuapp.com`
     });
   } catch (error) {
-    console.error('Deployment error:', error);
-    res.status(500).json({ error: 'Failed to deploy to Heroku', details: error.message });
+    console.error('DEPLOY ERROR:', error.message);
+    res.status(500).json({ error: 'Deployment failed', details: error.message });
   }
 });
 
@@ -190,28 +210,64 @@ app.post('/delete-app', async (req, res) => {
   }
 });
 
+// Admin routes
 app.post('/admin/login', (req, res) => {
   const { password } = req.body;
   if (password === ADMIN_PASSWORD) return res.json({ success: true });
   res.status(401).json({ error: 'Invalid password' });
 });
 
-app.post('/admin/users', async (req, res) => {
+app.post('/admin/users', (req, res) => {
   if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-
   const userList = Object.values(users).map(u => ({
-   ...u,
+  ...u,
     active_bots: bots.filter(b => b.github_username === u.github_username).length
   }));
   res.json({ users: userList });
 });
 
-app.post('/get-all-apps', async (req, res) => {
+app.post('/admin/heroku-apps', async (req, res) => {
   if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  res.json({ apps: bots });
+
+  try {
+    let apps;
+    if (HEROKU_TEAM) {
+      apps = await herokuRequest('GET', `/teams/${HEROKU_TEAM}/apps`);
+    } else {
+      apps = await herokuRequest('GET', '/apps');
+    }
+
+    const botApps = apps.filter(app => app.name.startsWith('teddy-')).map(app => ({
+      name: app.name,
+      id: app.id,
+      created_at: app.created_at,
+      updated_at: app.updated_at,
+      web_url: app.web_url,
+      region: app.region?.name || 'us',
+      team: app.team?.name || 'personal'
+    }));
+
+    res.json({ apps: botApps });
+  } catch (error) {
+    console.error('Heroku apps error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// Serve static frontend
+app.post('/admin/delete-heroku-app', async (req, res) => {
+  if (req.body.password!== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  const { appName } = req.body;
+
+  try {
+    await deleteHerokuApp(appName);
+    bots = bots.filter(b => b.heroku_app_name!== appName);
+    res.json({ success: true, message: `Deleted ${appName}` });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Serve frontend
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
